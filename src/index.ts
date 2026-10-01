@@ -9,7 +9,11 @@ import type { Page } from "playwright";
 const PROFILE_DIR = "./.profile";
 const MAX_ROUNDS = 8;
 
-async function repl(page: Page, timeoutMs: number): Promise<void> {
+async function repl(
+  page: Page,
+  timeoutMs: number,
+  skipLangs: Set<string>,
+): Promise<void> {
   console.log("");
   console.log("─".repeat(60));
   console.log("  Type your prompt and press Enter.");
@@ -34,10 +38,11 @@ async function repl(page: Page, timeoutMs: number): Promise<void> {
       console.log(markdown.trimEnd());
       console.log("─".repeat(60));
 
-      const block = firstBlock(markdown);
+      const block = firstBlock(markdown, skipLangs);
       if (!block) return;
 
-      console.log(`\n▶ $ ${block.code}\n`);
+      const lang = block.lang || "(unlabeled)";
+      console.log(`\n▶ [${lang}] $ ${block.code}\n`);
       const result = await runShell(block.code, timeoutMs);
       console.log(result.output);
 
@@ -86,7 +91,7 @@ async function main(): Promise<void> {
       );
     }
 
-    await repl(page, settings.timeoutMs);
+    await repl(page, settings.timeoutMs, new Set(settings.skipLangs));
   } finally {
     await context.close();
   }

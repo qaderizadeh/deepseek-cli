@@ -2,16 +2,35 @@ export type Settings = {
   deepThink: boolean;
   search: boolean;
   timeoutMs: number;
+  skipLangs: string[];
 };
+
+// "" means unlabeled fences (```` ``` ```` with no language) are skipped too.
+const DEFAULT_SKIP_LANGS = [
+  "",
+  "text",
+  "txt",
+  "plain",
+  "plaintext",
+  "json",
+  "output",
+  "none",
+  "markdown",
+  "md",
+];
 
 const DEFAULTS: Settings = {
   deepThink: true,
   search: false,
   timeoutMs: 60_000,
+  skipLangs: [...DEFAULT_SKIP_LANGS],
 };
 
 export function parseSettings(argv: string[]): Settings {
-  const settings = { ...DEFAULTS };
+  const settings: Settings = {
+    ...DEFAULTS,
+    skipLangs: [...DEFAULTS.skipLangs],
+  };
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -37,6 +56,23 @@ export function parseSettings(argv: string[]): Settings {
         settings.timeoutMs = Math.round(seconds * 1000);
         break;
       }
+      case "--skip": {
+        const value = argv[++i];
+        if (value === undefined) {
+          throw new Error("--skip requires a language value");
+        }
+        settings.skipLangs.push(value.toLowerCase());
+        break;
+      }
+      case "--no-skip":
+        // Clear the defaults entirely — allows constructing a fresh list
+        // by following this with --skip entries.
+        settings.skipLangs = [];
+        break;
+      case "--run-empty":
+        // Explicitly allow running unlabeled fences.
+        settings.skipLangs = settings.skipLangs.filter((l) => l !== "");
+        break;
       default:
         if (arg.startsWith("--")) {
           throw new Error(`Unknown flag: ${arg}`);
@@ -49,7 +85,13 @@ export function parseSettings(argv: string[]): Settings {
 export function describe(settings: Settings): string {
   const on = (v: boolean) => (v ? "on" : "off");
   const secs = Math.round(settings.timeoutMs / 1000);
-  return `DeepThink: ${on(settings.deepThink)} | Search: ${on(
-    settings.search,
-  )} | Exec timeout: ${secs}s`;
+  const skip = settings.skipLangs.length
+    ? settings.skipLangs.map((l) => (l === "" ? "(unlabeled)" : l)).join(", ")
+    : "(none)";
+  return (
+    `DeepThink: ${on(settings.deepThink)} | ` +
+    `Search: ${on(settings.search)} | ` +
+    `Exec timeout: ${secs}s | ` +
+    `Skip: ${skip}`
+  );
 }

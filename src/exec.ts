@@ -8,14 +8,34 @@ export type ExecResult = {
   timedOut: boolean;
 };
 
-export function firstBlock(markdown: string): CodeBlock | null {
-  const re = /```([\w-]*)[^\n]*\n([\s\S]*?)```/;
-  const m = markdown.match(re);
-  if (!m) return null;
-  return {
-    lang: (m[1] || "").toLowerCase(),
-    code: m[2].replace(/\n+$/, "").trim(),
-  };
+/**
+ * Parse all fenced code blocks. The language is everything before the first
+ * whitespace on the fence line, normalized to lower case and stripped of
+ * `{.…}` or surrounding backticks. Handles "```text", "``` text",
+ * "```TEXT title", "```{.text}", etc.
+ */
+export function parseBlocks(markdown: string): CodeBlock[] {
+  const blocks: CodeBlock[] = [];
+  const re = /```([^\n]*)\n([\s\S]*?)\n?```/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(markdown)) !== null) {
+    const info = (m[1] ?? "").trim();
+    const first = info.split(/\s+/)[0] ?? "";
+    const lang = first.replace(/^[{.`]+|`+$/g, "").toLowerCase();
+    blocks.push({ lang, code: m[2].replace(/\n+$/, "") });
+  }
+  return blocks;
+}
+
+export function firstBlock(
+  markdown: string,
+  skipLangs: Set<string> = new Set(),
+): CodeBlock | null {
+  for (const b of parseBlocks(markdown)) {
+    if (skipLangs.has(b.lang)) continue;
+    return b;
+  }
+  return null;
 }
 
 export function runShell(
@@ -23,8 +43,6 @@ export function runShell(
   timeoutMs = 60_000,
 ): Promise<ExecResult> {
   return new Promise((resolve) => {
-    // detached: true puts the child in its own process group so we can
-    // kill the whole tree (shell + grandchildren) at once.
     const child = spawn(command, {
       shell: true,
       cwd: process.cwd(),
@@ -54,7 +72,6 @@ export function runShell(
     const killGroup = (signal: NodeJS.Signals) => {
       if (child.pid == null) return;
       try {
-        // Negative PID = kill the entire process group.
         process.kill(-child.pid, signal);
       } catch {
         try {
@@ -69,9 +86,6 @@ export function runShell(
       timedOut = true;
       killGroup("SIGTERM");
 
-      // After grace period, force-kill the group and resolve regardless.
-      // Needed because an orphaned grandchild can keep stdio open, so
-      // 'close' may never fire.
       setTimeout(() => {
         killGroup("SIGKILL");
         setTimeout(() => finish(null), 500);
