@@ -12,10 +12,8 @@ const inputSelector = "textarea, [contenteditable='true']";
 const deepThinkSelector = ".ds-toggle-button:has-text('DeepThink')";
 const searchSelector = ".ds-toggle-button:has-text('Search')";
 
-// The assistant's rendered answer, confirmed from the DOM dump.
 const answerSelector = ".ds-assistant-message-main-content";
 
-// Classes that must never contribute text (code-block toolbars, buttons).
 const skipClasses = [
   "md-code-block-banner",
   "md-code-block-banner-wrap",
@@ -23,11 +21,11 @@ const skipClasses = [
   "ds-button__content",
 ];
 
-// The copy icon's SVG path starts with this exact prefix, both for the
-// per-code-block copy and the whole-message copy.
 const copyIconPathPrefix = "M6.14929 4.02032";
 
-// Baseline captured just before send.
+const answerTargetAttr = "data-cli-answer-target";
+
+let answerBaselineCount = 0;
 let answerBaselineText = "";
 
 type Settings = { deepThink: boolean; search: boolean };
@@ -36,6 +34,47 @@ async function isLoggedIn(page: Page): Promise<boolean> {
   const loginButton = page.getByText(/log ?in/i).first();
   if (await loginButton.isVisible().catch(() => false)) return false;
   return page.locator(inputSelector).first().isVisible().catch(() => false);
+}
+
+/**
+ * Best-effort: dismiss the cookie banner and any other overlay that could
+ * sit on top of chat elements. Safe to call repeatedly.
+ */
+async function dismissOverlays(page: Page): Promise<void> {
+  await page
+    .evaluate(() => {
+      const selectors = [
+        ".cookie_banner-wrap",
+        ".cookie_banner",
+        "[class*='cookie_banner']",
+        "[class*='CookieBanner']",
+      ];
+      for (const sel of selectors) {
+        document.querySelectorAll(sel).forEach((el) => {
+          try {
+            (el as HTMLElement).style.display = "none";
+            el.remove();
+          } catch {}
+        });
+      }
+      // Try common accept buttons too.
+      const buttons = Array.from(document.querySelectorAll("button, [role='button']")) as HTMLElement[];
+      for (const b of buttons) {
+        const t = (b.textContent || "").trim().toLowerCase();
+        if (
+          t === "accept" ||
+          t === "accept all" ||
+          t === "agree" ||
+          t === "ok" ||
+          t === "got it"
+        ) {
+          try {
+            b.click();
+          } catch {}
+        }
+      }
+    })
+    .catch(() => {});
 }
 
 async function listChats(page: Page): Promise<Chat[]> {
@@ -64,9 +103,11 @@ async function openChat(page: Page, chat: Chat): Promise<void> {
     await page.locator(chatItemSelector).nth(chat.index).click();
   }
   await page.waitForLoadState("domcontentloaded");
+  await dismissOverlays(page);
 }
 
 async function newChat(page: Page): Promise<void> {
+  await dismissOverlays(page);
   await page.getByText(/new chat/i).first().click();
   await page.waitForLoadState("domcontentloaded");
 }
@@ -95,7 +136,12 @@ async function ensureToggle(
     return true;
   }
 
-  await button.click();
+  // Dispatch directly — overlay-proof.
+  await button.evaluate((el) => {
+    el.dispatchEvent(
+      new MouseEvent("click", { bubbles: true, cancelable: true, view: window }),
+    );
+  }).catch(() => {});
   await page.waitForTimeout(300);
 
   const after = await readToggleState(button);
@@ -142,15 +188,111 @@ async function clearComposer(page: Page, input: Locator): Promise<void> {
   await page.waitForTimeout(80);
 }
 
-async function sendPrompt(page: Page, text: string): Promise<void> {
-  const base = await page
+async function scrollToBottom(page: Page): Promise<void> {
+  await page
     .evaluate((sel) => {
       const els = document.querySelectorAll(sel);
       const last = els[els.length - 1] as HTMLElement | undefined;
-      return { lastText: last ? last.textContent || "" : "" };
+
+      if (last) {
+        try {
+          last.scrollIntoView({ block: "end", behavior: "auto" });
+        } catch {}
+
+        let node: HTMLElement | null = last;
+        while (node) {
+          const style = getComputedStyle(node);
+          const oy = style.overflowY;
+          if (
+            (oy === "auto" || oy === "scroll" || oy === "overlay") &&
+            node.scrollHeight > node.clientHeight
+          ) {
+            node.scrollTop = node.scrollHeight;
+          }
+          node = node.parentElement;
+        }
+      }
+
+      const doc = document.scrollingElement as HTMLElement | null;
+      if (doc) doc.scrollTop = doc.scrollHeight;
+      if (document.body) document.body.scrollTop = document.body.scrollHeight;
+      if (document.documentElement) {
+        document.documentElement.scrollTop =
+          document.documentElement.scrollHeight;
+      }
     }, answerSelector)
-    .catch(() => ({ lastText: "" }));
-  answerBaselineText = base.lastText;
+    .catch(() => {});
+}
+
+async function readAnswerState(page: Page): Promise<{
+  count: number;
+  lastText: string;
+  lastNonEmpty: string;
+}> {
+  const timeout = new Promise<{
+    count: number;
+    lastText: string;
+    lastNonEmpty: string;
+  }>((resolve) =>
+    setTimeout(() => resolve({ count: -1, lastText: "", lastNonEmpty: "" }), 8000),
+  );
+
+  const probe = page
+    .evaluate((sel) => {
+      const els = Array.from(document.querySelectorAll(sel)) as HTMLElement[];
+      const lastEl = els[els.length - 1];
+      const lastText = lastEl ? lastEl.textContent || "" : "";
+
+      let lastNonEmpty = "";
+      for (let i = els.length - 1; i >= 0; i--) {
+        const t = els[i].textContent || "";
+        if (t.trim().length > 0) {
+          lastNonEmpty = t;
+          break;
+        }
+      }
+      return { count: els.length, lastText, lastNonEmpty };
+    }, answerSelector)
+    .catch(() => ({ count: -1, lastText: "", lastNonEmpty: "" }));
+
+  return Promise.race([probe, timeout]);
+}
+
+async function isGenerating(page: Page): Promise<boolean> {
+  const stop = page
+    .locator(
+      'button:has-text("Stop"), [role="button"]:has-text("Stop"), ' +
+        '[aria-label*="stop" i], [aria-label*="Stop generating" i]',
+    )
+    .first();
+  return stop.isVisible().catch(() => false);
+}
+
+async function tagCurrentAnswer(page: Page): Promise<void> {
+  await page
+    .evaluate(
+      ([sel, attr]) => {
+        document
+          .querySelectorAll(`[${attr}]`)
+          .forEach((el) => el.removeAttribute(attr));
+
+        const els = Array.from(document.querySelectorAll(sel)) as HTMLElement[];
+        const last = els[els.length - 1];
+        if (last) last.setAttribute(attr, "1");
+      },
+      [answerSelector, answerTargetAttr] as const,
+    )
+    .catch(() => {});
+}
+
+async function sendPrompt(page: Page, text: string): Promise<void> {
+  await dismissOverlays(page);
+  await scrollToBottom(page);
+  await page.waitForTimeout(500);
+
+  const base = await readAnswerState(page);
+  answerBaselineCount = base.count === -1 ? 0 : base.count;
+  answerBaselineText = base.count === -1 ? "" : base.lastNonEmpty;
 
   const input = page.locator(inputSelector).first();
   await input.waitFor({ state: "visible" });
@@ -192,8 +334,17 @@ async function sendPrompt(page: Page, text: string): Promise<void> {
       .last();
 
     if (await sendBtn.isVisible().catch(() => false)) {
+      // Dispatch directly — overlay-proof.
       await sendBtn
-        .evaluate((el) => (el as HTMLElement).click())
+        .evaluate((el) => {
+          el.dispatchEvent(
+            new MouseEvent("click", {
+              bubbles: true,
+              cancelable: true,
+              view: window,
+            }),
+          );
+        })
         .catch(() => {});
     }
     await input.press("Enter").catch(() => {});
@@ -209,88 +360,17 @@ async function sendPrompt(page: Page, text: string): Promise<void> {
   );
 }
 
-/**
- * Scroll the chat to bottom. Walks scrollable ancestors of the last answer
- * element AND the document-level scrollers.
- */
-async function scrollToBottom(page: Page): Promise<void> {
-  await page
-    .evaluate((sel) => {
-      const els = document.querySelectorAll(sel);
-      const last = els[els.length - 1] as HTMLElement | undefined;
-
-      if (last) {
-        try {
-          last.scrollIntoView({ block: "end", behavior: "auto" });
-        } catch {}
-
-        let node: HTMLElement | null = last;
-        while (node) {
-          const style = getComputedStyle(node);
-          const oy = style.overflowY;
-          if (
-            (oy === "auto" || oy === "scroll" || oy === "overlay") &&
-            node.scrollHeight > node.clientHeight
-          ) {
-            node.scrollTop = node.scrollHeight;
-          }
-          node = node.parentElement;
-        }
-      }
-
-      const doc = document.scrollingElement as HTMLElement | null;
-      if (doc) doc.scrollTop = doc.scrollHeight;
-      if (document.body) document.body.scrollTop = document.body.scrollHeight;
-      if (document.documentElement) {
-        document.documentElement.scrollTop =
-          document.documentElement.scrollHeight;
-      }
-    }, answerSelector)
-    .catch(() => {});
-}
-
-async function readAnswerState(
-  page: Page,
-): Promise<{ count: number; lastText: string }> {
-  const timeout = new Promise<{ count: number; lastText: string }>((resolve) =>
-    setTimeout(() => resolve({ count: -1, lastText: "" }), 8000),
-  );
-
-  const probe = page
-    .evaluate((sel) => {
-      const els = document.querySelectorAll(sel);
-      const last = els[els.length - 1] as HTMLElement | undefined;
-      return {
-        count: els.length,
-        lastText: last ? last.textContent || "" : "",
-      };
-    }, answerSelector)
-    .catch(() => ({ count: -1, lastText: "" }));
-
-  return Promise.race([probe, timeout]);
-}
-
-async function isGenerating(page: Page): Promise<boolean> {
-  const stop = page
-    .locator(
-      'button:has-text("Stop"), [role="button"]:has-text("Stop"), ' +
-        '[aria-label*="stop" i], [aria-label*="Stop generating" i]',
-    )
-    .first();
-  return stop.isVisible().catch(() => false);
-}
-
 async function waitForCompletion(
   page: Page,
-  stableMs = 2500,
+  stableMs = 3000,
   timeoutMs = 5 * 60_000,
 ): Promise<void> {
   const start = Date.now();
   const deadline = start + timeoutMs;
+  const countDeadline = start + 10_000;
 
   await scrollToBottom(page);
 
-  let appeared = false;
   let scrollTick = 0;
   let lastHeartbeat = Date.now();
 
@@ -298,12 +378,19 @@ async function waitForCompletion(
     if (scrollTick++ % 6 === 0) await scrollToBottom(page);
 
     const state = await readAnswerState(page);
+    if (state.count === -1) {
+      await page.waitForTimeout(500);
+      continue;
+    }
 
-    if (state.count !== -1) {
-      const textChanged =
-        state.lastText.length > 0 && state.lastText !== answerBaselineText;
-      if (textChanged) {
-        appeared = true;
+    if (state.count > answerBaselineCount) break;
+
+    if (Date.now() > countDeadline) {
+      if (
+        state.lastNonEmpty.length > 0 &&
+        answerBaselineText.length > 0 &&
+        state.lastNonEmpty !== answerBaselineText
+      ) {
         break;
       }
     }
@@ -322,56 +409,79 @@ async function waitForCompletion(
     await page.waitForTimeout(500);
   }
 
-  if (!appeared) {
+  if (Date.now() >= deadline) {
     throw new Error(
-      `No answer appeared within ${Math.round(timeoutMs / 1000)}s.`,
+      `No new answer appeared within ${Math.round(timeoutMs / 1000)}s.`,
     );
   }
 
-  let prevLen = -1;
+  let prevText = "";
   let stableSince = Date.now();
   scrollTick = 0;
+  let streaming = false;
 
   while (Date.now() < deadline) {
     if (scrollTick++ % 6 === 0) await scrollToBottom(page);
 
     const state = await readAnswerState(page);
-    const len = state.count === -1 ? prevLen : state.lastText.length;
+    if (state.count === -1) {
+      await page.waitForTimeout(500);
+      continue;
+    }
 
-    if (len > 0 && len === prevLen) {
-      if (Date.now() - stableSince >= stableMs) return;
+    const text = state.lastText;
+
+    if (text.length === 0) {
+      streaming = false;
+      prevText = "";
+      stableSince = Date.now();
+    } else if (text === prevText) {
+      if (Date.now() - stableSince >= stableMs) {
+        await tagCurrentAnswer(page);
+        return;
+      }
     } else {
-      prevLen = len;
+      streaming = true;
+      prevText = text;
       stableSince = Date.now();
     }
+
+    if (Date.now() - lastHeartbeat > 15_000) {
+      const secs = Math.round((Date.now() - start) / 1000);
+      console.log(
+        streaming
+          ? `   … answer streaming (${secs}s)`
+          : `   … waiting for response (${secs}s)`,
+      );
+      lastHeartbeat = Date.now();
+    }
+
     await page.waitForTimeout(500);
   }
+
+  throw new Error(
+    `No new answer appeared within ${Math.round(timeoutMs / 1000)}s.`,
+  );
 }
 
-/**
- * Find the whole-message copy button for the *last assistant answer*.
- *
- * Positional rule — no dependence on wrapper class names:
- *   1. Locate the last `.ds-assistant-message-main-content`.
- *   2. Collect every copy-icon button on the page (svg path starting with
- *      the copy-icon prefix, not inside a code-block banner, not inside an
- *      answer's rendered content).
- *   3. Return the first candidate that appears *after* the last answer in
- *      document order. That's the toolbar button on the answer's own row.
- *
- * This works the same on Firefox, Chromium, WebKit, and Chrome/Edge channels,
- * regardless of how each browser serializes the surrounding wrapper classes.
- */
 async function tagAnswerCopyButton(page: Page): Promise<Locator | null> {
   const marker = `cli-copy-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   const tagOnce = async (): Promise<boolean> => {
     return await page
       .evaluate(
-        ([ansSel, prefix, mk]) => {
-          const answers = document.querySelectorAll(ansSel);
-          const last = answers[answers.length - 1] as HTMLElement | undefined;
-          if (!last) return false;
+        ([ansSel, attr, prefix, mk]) => {
+          let target =
+            (document.querySelector(`[${attr}]`) as HTMLElement | null) ??
+            null;
+
+          if (!target) {
+            const answers = Array.from(
+              document.querySelectorAll(ansSel),
+            ) as HTMLElement[];
+            target = answers[answers.length - 1] ?? null;
+          }
+          if (!target) return false;
 
           const buttons = Array.from(
             document.querySelectorAll('div[role="button"], [role="button"]'),
@@ -384,16 +494,24 @@ async function tagAnswerCopyButton(page: Page): Promise<Locator | null> {
             const d = path?.getAttribute("d") ?? "";
             if (!d.startsWith(prefix)) continue;
 
-            // DOCUMENT_POSITION_FOLLOWING === 4
-            const pos = last.compareDocumentPosition(el);
-            if (!(pos & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
+            const pos = target.compareDocumentPosition(el);
+            const isAfter = !!(pos & Node.DOCUMENT_POSITION_FOLLOWING);
+            const targetRow = target.closest(
+              ".ds-message, [data-virtual-list-item-key]",
+            );
+            const elRow = el.closest(
+              ".ds-message, [data-virtual-list-item-key]",
+            );
+            const sameRow = targetRow !== null && targetRow === elRow;
+
+            if (!isAfter && !sameRow) continue;
 
             el.setAttribute("data-cli-copy-target", mk);
             return true;
           }
           return false;
         },
-        [answerSelector, copyIconPathPrefix, marker] as const,
+        [answerSelector, answerTargetAttr, copyIconPathPrefix, marker] as const,
       )
       .catch(() => false);
   };
@@ -402,9 +520,12 @@ async function tagAnswerCopyButton(page: Page): Promise<Locator | null> {
     return page.locator(`[data-cli-copy-target="${marker}"]`).first();
   }
 
-  const answer = page.locator(answerSelector).last();
-  await answer.scrollIntoViewIfNeeded().catch(() => {});
-  await answer.hover({ force: true }).catch(() => {});
+  const tagged = page.locator(`[${answerTargetAttr}]`).first();
+  const hoverTarget =
+    (await tagged.count()) > 0 ? tagged : page.locator(answerSelector).last();
+
+  await hoverTarget.scrollIntoViewIfNeeded().catch(() => {});
+  await hoverTarget.hover({ force: true }).catch(() => {});
   await page.waitForTimeout(700);
 
   if (await tagOnce()) {
@@ -412,7 +533,7 @@ async function tagAnswerCopyButton(page: Page): Promise<Locator | null> {
   }
 
   await scrollToBottom(page);
-  await answer.hover({ force: true }).catch(() => {});
+  await hoverTarget.hover({ force: true }).catch(() => {});
   await page.waitForTimeout(700);
 
   if (await tagOnce()) {
@@ -432,8 +553,22 @@ async function copyLastAnswer(page: Page): Promise<string> {
     throw new Error("Copy button not found on the last answer message.");
   }
 
-  await button.click({ force: true });
-  await page.waitForTimeout(600);
+  // Dispatch a synthetic click directly on the element. Coordinate-based
+  // clicks hit whatever is on top — Replit's cookie banner was swallowing
+  // them. dispatchEvent bypasses hit-testing entirely.
+  await button
+    .evaluate((el) => {
+      el.dispatchEvent(
+        new MouseEvent("click", {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+        }),
+      );
+    })
+    .catch(() => {});
+
+  await page.waitForTimeout(800);
 
   let copied = await page.evaluate(() => (window as any).__copiedText ?? "");
 
@@ -449,14 +584,13 @@ async function copyLastAnswer(page: Page): Promise<string> {
   return (copied as string) ?? "";
 }
 
-/**
- * Reconstruct markdown from the rendered answer DOM.
- * Used only when the copy button path fails entirely.
- */
 async function readMarkdownFromDom(page: Page): Promise<string> {
   await scrollToBottom(page);
 
-  const container = page.locator(answerSelector).last();
+  const tagged = page.locator(`[${answerTargetAttr}]`).first();
+  const container =
+    (await tagged.count()) > 0 ? tagged : page.locator(answerSelector).last();
+
   if (!(await container.isVisible().catch(() => false))) return "";
 
   return container.evaluate(
