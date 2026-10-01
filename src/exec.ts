@@ -23,28 +23,25 @@ export function runShell(
   timeoutMs = 60_000,
 ): Promise<ExecResult> {
   return new Promise((resolve) => {
-    const child = spawn(command, { shell: true, cwd: process.cwd() });
+    // detached: true puts the child in its own process group so we can
+    // kill the whole tree (shell + grandchildren) at once.
+    const child = spawn(command, {
+      shell: true,
+      cwd: process.cwd(),
+      detached: true,
+    });
+
     let output = "";
     let timedOut = false;
+    let resolved = false;
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGTERM");
-      // Give it 2 s to die gracefully, then force-kill.
-      setTimeout(() => child.kill("SIGKILL"), 2000);
-    }, timeoutMs);
-
-    child.stdout.on("data", (d) => (output += d.toString()));
-    child.stderr.on("data", (d) => (output += d.toString()));
-
-    child.on("close", (code) => {
+    const finish = (code: number | null) => {
+      if (resolved) return;
+      resolved = true;
       clearTimeout(timer);
+
       const trimmed = output.trimEnd();
-      const parts = [
-        `$ ${command}`,
-        "",
-        trimmed || "(no output)",
-      ];
+      const parts = [`$ ${command}`, "", trimmed || "(no output)"];
       if (timedOut) {
         parts.push("");
         parts.push(`[timed out after ${Math.round(timeoutMs / 1000)}s]`);
@@ -52,15 +49,42 @@ export function runShell(
       parts.push("");
       parts.push(`(exit ${code ?? "?"})`);
       resolve({ output: parts.join("\n"), exitCode: code, timedOut });
-    });
+    };
 
+    const killGroup = (signal: NodeJS.Signals) => {
+      if (child.pid == null) return;
+      try {
+        // Negative PID = kill the entire process group.
+        process.kill(-child.pid, signal);
+      } catch {
+        try {
+          child.kill(signal);
+        } catch {
+          /* already dead */
+        }
+      }
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killGroup("SIGTERM");
+
+      // After grace period, force-kill the group and resolve regardless.
+      // Needed because an orphaned grandchild can keep stdio open, so
+      // 'close' may never fire.
+      setTimeout(() => {
+        killGroup("SIGKILL");
+        setTimeout(() => finish(null), 500);
+      }, 2000);
+    }, timeoutMs);
+
+    child.stdout?.on("data", (d) => (output += d.toString()));
+    child.stderr?.on("data", (d) => (output += d.toString()));
+
+    child.on("close", (code) => finish(code));
     child.on("error", (err) => {
-      clearTimeout(timer);
-      resolve({
-        output: `$ ${command}\n\n${String(err)}\n\n(exit ?)`,
-        exitCode: -1,
-        timedOut,
-      });
+      output += `\n${String(err)}`;
+      finish(-1);
     });
   });
 }
