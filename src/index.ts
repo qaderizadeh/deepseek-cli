@@ -3,11 +3,13 @@ import { ensureLoggedIn } from "./auth.js";
 import { deepseek } from "./sites.js";
 import { selectChat, ask, runRepl } from "./chat.js";
 import { parseSettings, describe } from "./settings.js";
+import { firstBlock, runShell } from "./exec.js";
 import type { Page } from "playwright";
 
 const PROFILE_DIR = "./.profile";
+const MAX_ROUNDS = 8;
 
-async function repl(page: Page): Promise<void> {
+async function repl(page: Page, timeoutMs: number): Promise<void> {
   console.log("");
   console.log("─".repeat(60));
   console.log("  Type your prompt and press Enter.");
@@ -21,14 +23,26 @@ async function repl(page: Page): Promise<void> {
       return;
     }
 
-    await deepseek.sendPrompt(page, line);
-    console.log("\n(thinking…)\n");
+    let prompt = line;
 
-    const markdown = await deepseek.readAnswer(page);
+    for (let round = 1; round <= MAX_ROUNDS; round++) {
+      await deepseek.sendPrompt(page, prompt);
+      console.log("\n(thinking…)\n");
 
-    console.log("─".repeat(60));
-    console.log(markdown.trimEnd());
-    console.log("─".repeat(60));
+      const markdown = await deepseek.readAnswer(page);
+      console.log("─".repeat(60));
+      console.log(markdown.trimEnd());
+      console.log("─".repeat(60));
+
+      const block = firstBlock(markdown);
+      if (!block) return;
+
+      console.log(`\n▶ $ ${block.code}\n`);
+      const result = await runShell(block.code, timeoutMs);
+      console.log(result.output);
+
+      prompt = result.output;
+    }
   });
 
   console.log("\nBye.");
@@ -72,7 +86,7 @@ async function main(): Promise<void> {
       );
     }
 
-    await repl(page);
+    await repl(page, settings.timeoutMs);
   } finally {
     await context.close();
   }

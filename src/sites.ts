@@ -27,6 +27,11 @@ const skipClasses = [
 // per-code-block copy and the whole-message copy.
 const copyIconPathPrefix = "M6.14929 4.02032";
 
+// Baseline captured just before send — used to distinguish the *new* answer
+// from whatever was already on screen.
+let answerBaselineCount = 0;
+let answerBaselineText = "";
+
 type Settings = { deepThink: boolean; search: boolean };
 
 async function isLoggedIn(page: Page): Promise<boolean> {
@@ -111,18 +116,171 @@ async function applySettings(page: Page, settings: Settings): Promise<boolean> {
   return a && b;
 }
 
-async function sendPrompt(page: Page, text: string): Promise<void> {
-  const input = page.locator(inputSelector).first();
-  await input.waitFor({ state: "visible" });
-  await input.click();
-  await page.keyboard.type(text, { delay: 5 });
-  await page.keyboard.press("Enter");
-  await page.waitForTimeout(400);
+async function readComposerText(input: Locator): Promise<string> {
+  return input
+    .evaluate((el) => {
+      if (el instanceof HTMLTextAreaElement) return el.value;
+      return el.textContent ?? "";
+    })
+    .catch(() => "");
 }
 
-async function readLastAnswerText(page: Page): Promise<string> {
-  const el = page.locator(answerSelector).last();
-  return (await el.innerText().catch(() => "")) ?? "";
+/** Collapse whitespace, trim, take first 20 chars. Both sides must use this. */
+function fingerprint(text: string): string {
+  return text.replace(/\s+/g, " ").trim().slice(0, 20);
+}
+
+/** True if the normalized composer text contains the fingerprint of `text`. */
+function composerHas(composerText: string, fp: string): boolean {
+  if (!fp) return true;
+  return composerText.replace(/\s+/g, " ").includes(fp);
+}
+
+/** Clear the composer via select-all + delete, then fill("") as a backstop. */
+async function clearComposer(page: Page, input: Locator): Promise<void> {
+  await input.click().catch(() => {});
+  await page.waitForTimeout(80);
+  await page.keyboard.press("Control+A").catch(() => {});
+  await page.keyboard.press("Delete").catch(() => {});
+  await page.waitForTimeout(80);
+  await input.fill("").catch(() => {});
+  await page.waitForTimeout(80);
+}
+
+async function sendPrompt(page: Page, text: string): Promise<void> {
+  // Snapshot pre-send state so we can tell the new answer apart from what
+  // was already on screen.
+  const base = await page
+    .evaluate((sel) => {
+      const els = document.querySelectorAll(sel);
+      const last = els[els.length - 1] as HTMLElement | undefined;
+      return {
+        count: els.length,
+        lastText: last ? last.textContent || "" : "",
+      };
+    }, answerSelector)
+    .catch(() => ({ count: 0, lastText: "" }));
+  answerBaselineCount = base.count;
+  answerBaselineText = base.lastText;
+
+  const input = page.locator(inputSelector).first();
+  await input.waitFor({ state: "visible" });
+  await input.scrollIntoViewIfNeeded().catch(() => {});
+
+  await clearComposer(page, input);
+
+  await input.click().catch(() => {});
+  await page.keyboard.insertText(text).catch(() => {});
+  await page.waitForTimeout(250);
+
+  const fp = fingerprint(text);
+  let composer = await readComposerText(input);
+  if (!composerHas(composer, fp)) {
+    await input.fill(text).catch(() => {});
+    await page.waitForTimeout(250);
+    composer = await readComposerText(input);
+    if (!composerHas(composer, fp)) {
+      throw new Error(
+        `Composer did not receive the prompt. Composer has: "${composer
+          .replace(/\s+/g, " ")
+          .slice(0, 80)}"`,
+      );
+    }
+  }
+
+  const deadline = Date.now() + 8000;
+  let attempt = 0;
+
+  while (Date.now() < deadline) {
+    attempt++;
+
+    const sendBtn = page
+      .locator(
+        'div[role="button"].ds-button--primary.ds-button--circle, ' +
+          'div[role="button"][aria-label*="send" i], ' +
+          'button[aria-label*="send" i]',
+      )
+      .last();
+
+    if (await sendBtn.isVisible().catch(() => false)) {
+      await sendBtn
+        .evaluate((el) => (el as HTMLElement).click())
+        .catch(() => {});
+    }
+    await input.press("Enter").catch(() => {});
+
+    await page.waitForTimeout(500);
+
+    const remaining = await readComposerText(input);
+    if (!composerHas(remaining, fp)) return;
+  }
+
+  throw new Error(
+    `Couldn't submit after ${attempt} attempts — composer still holds the prompt.`,
+  );
+}
+
+/**
+ * One-shot scroll to bottom. Single evaluate, no keyboard events.
+ */
+async function scrollToBottom(page: Page): Promise<void> {
+  await page
+    .evaluate((sel) => {
+      const els = document.querySelectorAll(sel);
+      const last = els[els.length - 1] as HTMLElement | undefined;
+      if (!last) return;
+      let node: HTMLElement | null = last;
+      while (node) {
+        const style = getComputedStyle(node);
+        if (
+          node.scrollHeight > node.clientHeight &&
+          /(auto|scroll)/.test(style.overflowY)
+        ) {
+          node.scrollTop = node.scrollHeight;
+        }
+        node = node.parentElement;
+      }
+    }, answerSelector)
+    .catch(() => {});
+}
+
+/**
+ * Fast state read. Uses textContent (no layout flush) — innerText was
+ * forcing a full layout on every poll, which timed out on large chats.
+ * Raced with an 8s budget so a stalled page can never freeze the loop.
+ */
+async function readAnswerState(
+  page: Page,
+): Promise<{ count: number; lastText: string }> {
+  const timeout = new Promise<{ count: number; lastText: string }>((resolve) =>
+    setTimeout(() => resolve({ count: -1, lastText: "" }), 8000),
+  );
+
+  const probe = page
+    .evaluate((sel) => {
+      const els = document.querySelectorAll(sel);
+      const last = els[els.length - 1] as HTMLElement | undefined;
+      return {
+        count: els.length,
+        lastText: last ? last.textContent || "" : "",
+      };
+    }, answerSelector)
+    .catch(() => ({ count: -1, lastText: "" }));
+
+  return Promise.race([probe, timeout]);
+}
+
+/**
+ * True if DeepSeek is currently generating a response (Stop button visible).
+ */
+async function isGenerating(page: Page): Promise<boolean> {
+  const stop = page
+    .locator(
+      'button:has-text("Stop"), [role="button"]:has-text("Stop"), ' +
+        '[aria-label*="stop" i], [aria-label*="Stop generating" i]',
+    )
+    .first();
+  return stop.isVisible().catch(() => false);
 }
 
 async function waitForCompletion(
@@ -130,22 +288,70 @@ async function waitForCompletion(
   stableMs = 2500,
   timeoutMs = 5 * 60_000,
 ): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
+  const start = Date.now();
+  const deadline = start + timeoutMs;
 
-  // Phase 1 — wait for the answer element to appear.
+  await scrollToBottom(page);
+
+  // Phase 1 — wait for the *new* answer to appear with non-empty, non-baseline
+  // text. Uses text-change detection (not just count) so container reuse and
+  // virtual-list recycling don't break it.
+  let appeared = false;
+  let scrollTick = 0;
+  let lastHeartbeat = Date.now();
+  let consecutiveTimeouts = 0;
+
   while (Date.now() < deadline) {
-    const count = await page.locator(answerSelector).count();
-    if (count > 0) break;
-    await page.waitForTimeout(300);
+    if (scrollTick++ % 6 === 0) await scrollToBottom(page);
+
+    const state = await readAnswerState(page);
+
+    if (state.count === -1) {
+      consecutiveTimeouts++;
+      if (consecutiveTimeouts === 3) {
+        console.log("   ! page evaluate is slow; still trying…");
+      }
+    } else {
+      consecutiveTimeouts = 0;
+
+      const textChanged =
+        state.lastText.length > 0 && state.lastText !== answerBaselineText;
+      if (textChanged) {
+        appeared = true;
+        break;
+      }
+    }
+
+    if (Date.now() - lastHeartbeat > 15_000) {
+      const secs = Math.round((Date.now() - start) / 1000);
+      const gen = await isGenerating(page);
+      console.log(
+        gen
+          ? `   … still generating (${secs}s)`
+          : `   … waiting for response (${secs}s)`,
+      );
+      lastHeartbeat = Date.now();
+    }
+
+    await page.waitForTimeout(500);
   }
 
-  // Phase 2 — poll until text length stops changing.
+  if (!appeared) {
+    throw new Error(
+      `No answer appeared within ${Math.round(timeoutMs / 1000)}s.`,
+    );
+  }
+
+  // Phase 2 — wait for the text to stop growing.
   let prevLen = -1;
   let stableSince = Date.now();
+  scrollTick = 0;
 
   while (Date.now() < deadline) {
-    const text = await readLastAnswerText(page);
-    const len = text.length;
+    if (scrollTick++ % 6 === 0) await scrollToBottom(page);
+
+    const state = await readAnswerState(page);
+    const len = state.count === -1 ? prevLen : state.lastText.length;
 
     if (len > 0 && len === prevLen) {
       if (Date.now() - stableSince >= stableMs) return;
@@ -153,54 +359,62 @@ async function waitForCompletion(
       prevLen = len;
       stableSince = Date.now();
     }
-    await page.waitForTimeout(400);
+    await page.waitForTimeout(500);
   }
 }
 
 /**
- * Find the whole-message Copy button.
- *
- * DeepSeek renders both the per-code-block copy and the whole-message copy
- * as `div[role="button"].ds-button` containing an SVG whose path starts
- * with the same `d` prefix. We match on that prefix, then exclude any
- * match nested inside `.md-code-block-banner` so only the whole-message
- * button remains. The toolbar only appears on hover, so we retry after
- * hovering the last answer.
+ * Find the whole-message Copy button that belongs to the *last assistant
+ * answer*. DeepSeek renders the same copy icon on user messages too, so we
+ * restrict the search to buttons that are NOT inside an answer's content
+ * and NOT inside a code-block banner.
  */
 async function findAnswerCopyButton(page: Page): Promise<Locator | null> {
-  const selector =
-    `div[role="button"].ds-button:has(svg path[d^="${copyIconPathPrefix}"])`;
+  await scrollToBottom(page);
+
+  const answer = page.locator(answerSelector).last();
+  if ((await answer.count()) === 0) return null;
+
+  const buttonSelector = `div[role="button"].ds-button:has(svg path[d^="${copyIconPathPrefix}"])`;
 
   const tryFind = async (): Promise<Locator | null> => {
-    const candidates = page.locator(selector);
-    const count = await candidates.count();
+    const all = page.locator(buttonSelector);
+    const count = await all.count();
 
-    // Walk bottom-up — the newest message's toolbar is last in the DOM.
     for (let i = count - 1; i >= 0; i--) {
-      const el = candidates.nth(i);
+      const btn = all.nth(i);
 
-      const inCodeBlock = await el
-        .evaluate((n) => !!(n as HTMLElement).closest(".md-code-block-banner"))
+      const ok = await btn
+        .evaluate((node, ansSel) => {
+          const el = node as HTMLElement;
+          if (el.closest(".md-code-block-banner")) return false;
+          if (el.closest(ansSel)) return false;
+          if (!el.closest(".ds-message, [data-virtual-list-item-key]"))
+            return false;
+          return true;
+        }, answerSelector)
         .catch(() => false);
-      if (inCodeBlock) continue;
 
-      if (await el.isVisible().catch(() => false)) return el;
+      if (!ok) continue;
+      if (await btn.isVisible().catch(() => false)) return btn;
     }
     return null;
   };
 
-  // Try without hover first.
   let button = await tryFind();
   if (button) return button;
 
-  // The message toolbar only appears on hover.
-  const answer = page.locator(answerSelector).last();
-  await answer.scrollIntoViewIfNeeded().catch(() => {});
-  await answer.hover().catch(() => {});
-  await page.waitForTimeout(600);
+  await answer.hover({ force: true }).catch(() => {});
+  await page.waitForTimeout(700);
 
   button = await tryFind();
-  return button;
+  if (button) return button;
+
+  await scrollToBottom(page);
+  await answer.hover({ force: true }).catch(() => {});
+  await page.waitForTimeout(700);
+
+  return tryFind();
 }
 
 async function copyLastAnswer(page: Page): Promise<string> {
@@ -216,10 +430,8 @@ async function copyLastAnswer(page: Page): Promise<string> {
   await button.click({ force: true });
   await page.waitForTimeout(600);
 
-  // Prefer the intercepted value.
   let copied = await page.evaluate(() => (window as any).__copiedText ?? "");
 
-  // Fall back to real clipboard read.
   if (!copied || !copied.trim()) {
     copied = await page.evaluate(async () => {
       try {
@@ -237,6 +449,8 @@ async function copyLastAnswer(page: Page): Promise<string> {
  * Used only when the copy button path fails entirely.
  */
 async function readMarkdownFromDom(page: Page): Promise<string> {
+  await scrollToBottom(page);
+
   const container = page.locator(answerSelector).last();
   if (!(await container.isVisible().catch(() => false))) return "";
 
@@ -256,7 +470,6 @@ async function readMarkdownFromDom(page: Page): Promise<string> {
 
         const tag = el.tagName.toLowerCase();
 
-        // Code fences: extract just <code>, ignore any banner siblings.
         if (tag === "pre") {
           const codeEl = el.querySelector("code");
           if (!codeEl) return "";
@@ -314,7 +527,6 @@ async function readMarkdownFromDom(page: Page): Promise<string> {
 async function readAnswer(page: Page): Promise<string> {
   await waitForCompletion(page);
 
-  // Preferred: real Copy button → exact markdown.
   try {
     const md = await copyLastAnswer(page);
     if (md.trim()) return md;
