@@ -27,9 +27,7 @@ const skipClasses = [
 // per-code-block copy and the whole-message copy.
 const copyIconPathPrefix = "M6.14929 4.02032";
 
-// Baseline captured just before send — used to distinguish the *new* answer
-// from whatever was already on screen.
-let answerBaselineCount = 0;
+// Baseline captured just before send.
 let answerBaselineText = "";
 
 type Settings = { deepThink: boolean; search: boolean };
@@ -125,18 +123,15 @@ async function readComposerText(input: Locator): Promise<string> {
     .catch(() => "");
 }
 
-/** Collapse whitespace, trim, take first 20 chars. Both sides must use this. */
 function fingerprint(text: string): string {
   return text.replace(/\s+/g, " ").trim().slice(0, 20);
 }
 
-/** True if the normalized composer text contains the fingerprint of `text`. */
 function composerHas(composerText: string, fp: string): boolean {
   if (!fp) return true;
   return composerText.replace(/\s+/g, " ").includes(fp);
 }
 
-/** Clear the composer via select-all + delete, then fill("") as a backstop. */
 async function clearComposer(page: Page, input: Locator): Promise<void> {
   await input.click().catch(() => {});
   await page.waitForTimeout(80);
@@ -148,19 +143,13 @@ async function clearComposer(page: Page, input: Locator): Promise<void> {
 }
 
 async function sendPrompt(page: Page, text: string): Promise<void> {
-  // Snapshot pre-send state so we can tell the new answer apart from what
-  // was already on screen.
   const base = await page
     .evaluate((sel) => {
       const els = document.querySelectorAll(sel);
       const last = els[els.length - 1] as HTMLElement | undefined;
-      return {
-        count: els.length,
-        lastText: last ? last.textContent || "" : "",
-      };
+      return { lastText: last ? last.textContent || "" : "" };
     }, answerSelector)
-    .catch(() => ({ count: 0, lastText: "" }));
-  answerBaselineCount = base.count;
+    .catch(() => ({ lastText: "" }));
   answerBaselineText = base.lastText;
 
   const input = page.locator(inputSelector).first();
@@ -221,34 +210,45 @@ async function sendPrompt(page: Page, text: string): Promise<void> {
 }
 
 /**
- * One-shot scroll to bottom. Single evaluate, no keyboard events.
+ * Scroll the chat to bottom. Walks scrollable ancestors of the last answer
+ * element AND the document-level scrollers.
  */
 async function scrollToBottom(page: Page): Promise<void> {
   await page
     .evaluate((sel) => {
       const els = document.querySelectorAll(sel);
       const last = els[els.length - 1] as HTMLElement | undefined;
-      if (!last) return;
-      let node: HTMLElement | null = last;
-      while (node) {
-        const style = getComputedStyle(node);
-        if (
-          node.scrollHeight > node.clientHeight &&
-          /(auto|scroll)/.test(style.overflowY)
-        ) {
-          node.scrollTop = node.scrollHeight;
+
+      if (last) {
+        try {
+          last.scrollIntoView({ block: "end", behavior: "auto" });
+        } catch {}
+
+        let node: HTMLElement | null = last;
+        while (node) {
+          const style = getComputedStyle(node);
+          const oy = style.overflowY;
+          if (
+            (oy === "auto" || oy === "scroll" || oy === "overlay") &&
+            node.scrollHeight > node.clientHeight
+          ) {
+            node.scrollTop = node.scrollHeight;
+          }
+          node = node.parentElement;
         }
-        node = node.parentElement;
+      }
+
+      const doc = document.scrollingElement as HTMLElement | null;
+      if (doc) doc.scrollTop = doc.scrollHeight;
+      if (document.body) document.body.scrollTop = document.body.scrollHeight;
+      if (document.documentElement) {
+        document.documentElement.scrollTop =
+          document.documentElement.scrollHeight;
       }
     }, answerSelector)
     .catch(() => {});
 }
 
-/**
- * Fast state read. Uses textContent (no layout flush) — innerText was
- * forcing a full layout on every poll, which timed out on large chats.
- * Raced with an 8s budget so a stalled page can never freeze the loop.
- */
 async function readAnswerState(
   page: Page,
 ): Promise<{ count: number; lastText: string }> {
@@ -270,9 +270,6 @@ async function readAnswerState(
   return Promise.race([probe, timeout]);
 }
 
-/**
- * True if DeepSeek is currently generating a response (Stop button visible).
- */
 async function isGenerating(page: Page): Promise<boolean> {
   const stop = page
     .locator(
@@ -293,27 +290,16 @@ async function waitForCompletion(
 
   await scrollToBottom(page);
 
-  // Phase 1 — wait for the *new* answer to appear with non-empty, non-baseline
-  // text. Uses text-change detection (not just count) so container reuse and
-  // virtual-list recycling don't break it.
   let appeared = false;
   let scrollTick = 0;
   let lastHeartbeat = Date.now();
-  let consecutiveTimeouts = 0;
 
   while (Date.now() < deadline) {
     if (scrollTick++ % 6 === 0) await scrollToBottom(page);
 
     const state = await readAnswerState(page);
 
-    if (state.count === -1) {
-      consecutiveTimeouts++;
-      if (consecutiveTimeouts === 3) {
-        console.log("   ! page evaluate is slow; still trying…");
-      }
-    } else {
-      consecutiveTimeouts = 0;
-
+    if (state.count !== -1) {
       const textChanged =
         state.lastText.length > 0 && state.lastText !== answerBaselineText;
       if (textChanged) {
@@ -342,7 +328,6 @@ async function waitForCompletion(
     );
   }
 
-  // Phase 2 — wait for the text to stop growing.
   let prevLen = -1;
   let stableSince = Date.now();
   scrollTick = 0;
@@ -364,57 +349,77 @@ async function waitForCompletion(
 }
 
 /**
- * Find the whole-message Copy button that belongs to the *last assistant
- * answer*. DeepSeek renders the same copy icon on user messages too, so we
- * restrict the search to buttons that are NOT inside an answer's content
- * and NOT inside a code-block banner.
+ * Find the whole-message copy button for the *last assistant answer*.
+ *
+ * Positional rule — no dependence on wrapper class names:
+ *   1. Locate the last `.ds-assistant-message-main-content`.
+ *   2. Collect every copy-icon button on the page (svg path starting with
+ *      the copy-icon prefix, not inside a code-block banner, not inside an
+ *      answer's rendered content).
+ *   3. Return the first candidate that appears *after* the last answer in
+ *      document order. That's the toolbar button on the answer's own row.
+ *
+ * This works the same on Firefox, Chromium, WebKit, and Chrome/Edge channels,
+ * regardless of how each browser serializes the surrounding wrapper classes.
  */
-async function findAnswerCopyButton(page: Page): Promise<Locator | null> {
-  await scrollToBottom(page);
+async function tagAnswerCopyButton(page: Page): Promise<Locator | null> {
+  const marker = `cli-copy-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-  const answer = page.locator(answerSelector).last();
-  if ((await answer.count()) === 0) return null;
+  const tagOnce = async (): Promise<boolean> => {
+    return await page
+      .evaluate(
+        ([ansSel, prefix, mk]) => {
+          const answers = document.querySelectorAll(ansSel);
+          const last = answers[answers.length - 1] as HTMLElement | undefined;
+          if (!last) return false;
 
-  const buttonSelector = `div[role="button"].ds-button:has(svg path[d^="${copyIconPathPrefix}"])`;
+          const buttons = Array.from(
+            document.querySelectorAll('div[role="button"], [role="button"]'),
+          ) as HTMLElement[];
 
-  const tryFind = async (): Promise<Locator | null> => {
-    const all = page.locator(buttonSelector);
-    const count = await all.count();
+          for (const el of buttons) {
+            if (el.closest(".md-code-block-banner")) continue;
+            if (el.closest(ansSel)) continue;
+            const path = el.querySelector("svg path");
+            const d = path?.getAttribute("d") ?? "";
+            if (!d.startsWith(prefix)) continue;
 
-    for (let i = count - 1; i >= 0; i--) {
-      const btn = all.nth(i);
+            // DOCUMENT_POSITION_FOLLOWING === 4
+            const pos = last.compareDocumentPosition(el);
+            if (!(pos & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
 
-      const ok = await btn
-        .evaluate((node, ansSel) => {
-          const el = node as HTMLElement;
-          if (el.closest(".md-code-block-banner")) return false;
-          if (el.closest(ansSel)) return false;
-          if (!el.closest(".ds-message, [data-virtual-list-item-key]"))
-            return false;
-          return true;
-        }, answerSelector)
-        .catch(() => false);
-
-      if (!ok) continue;
-      if (await btn.isVisible().catch(() => false)) return btn;
-    }
-    return null;
+            el.setAttribute("data-cli-copy-target", mk);
+            return true;
+          }
+          return false;
+        },
+        [answerSelector, copyIconPathPrefix, marker] as const,
+      )
+      .catch(() => false);
   };
 
-  let button = await tryFind();
-  if (button) return button;
+  if (await tagOnce()) {
+    return page.locator(`[data-cli-copy-target="${marker}"]`).first();
+  }
 
+  const answer = page.locator(answerSelector).last();
+  await answer.scrollIntoViewIfNeeded().catch(() => {});
   await answer.hover({ force: true }).catch(() => {});
   await page.waitForTimeout(700);
 
-  button = await tryFind();
-  if (button) return button;
+  if (await tagOnce()) {
+    return page.locator(`[data-cli-copy-target="${marker}"]`).first();
+  }
 
   await scrollToBottom(page);
   await answer.hover({ force: true }).catch(() => {});
   await page.waitForTimeout(700);
 
-  return tryFind();
+  if (await tagOnce()) {
+    return page.locator(`[data-cli-copy-target="${marker}"]`).first();
+  }
+
+  return null;
 }
 
 async function copyLastAnswer(page: Page): Promise<string> {
@@ -422,9 +427,9 @@ async function copyLastAnswer(page: Page): Promise<string> {
     (window as any).__copiedText = "";
   });
 
-  const button = await findAnswerCopyButton(page);
+  const button = await tagAnswerCopyButton(page);
   if (!button) {
-    throw new Error("Copy button not found on the answer message.");
+    throw new Error("Copy button not found on the last answer message.");
   }
 
   await button.click({ force: true });

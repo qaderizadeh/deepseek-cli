@@ -57,7 +57,10 @@ async function main(): Promise<void> {
   const settings = parseSettings(process.argv.slice(2));
   console.log(describe(settings));
 
-  const context = await launchPersistent({ profileDir: PROFILE_DIR });
+  const context = await launchPersistent({
+    profileDir: PROFILE_DIR,
+    preferred: settings.browser,
+  });
 
   try {
     const page = await ensureLoggedIn(context, {

@@ -3,9 +3,9 @@ export type Settings = {
   search: boolean;
   timeoutMs: number;
   skipLangs: string[];
+  browser: string | null;
 };
 
-// "" means unlabeled fences (```` ``` ```` with no language) are skipped too.
 const DEFAULT_SKIP_LANGS = [
   "",
   "text",
@@ -24,6 +24,7 @@ const DEFAULTS: Settings = {
   search: false,
   timeoutMs: 60_000,
   skipLangs: [...DEFAULT_SKIP_LANGS],
+  browser: null,
 };
 
 export function parseSettings(argv: string[]): Settings {
@@ -56,6 +57,12 @@ export function parseSettings(argv: string[]): Settings {
         settings.timeoutMs = Math.round(seconds * 1000);
         break;
       }
+      case "--browser": {
+        const value = argv[++i];
+        if (!value) throw new Error("--browser requires a name");
+        settings.browser = value.toLowerCase();
+        break;
+      }
       case "--skip": {
         const value = argv[++i];
         if (value === undefined) {
@@ -65,12 +72,9 @@ export function parseSettings(argv: string[]): Settings {
         break;
       }
       case "--no-skip":
-        // Clear the defaults entirely — allows constructing a fresh list
-        // by following this with --skip entries.
         settings.skipLangs = [];
         break;
       case "--run-empty":
-        // Explicitly allow running unlabeled fences.
         settings.skipLangs = settings.skipLangs.filter((l) => l !== "");
         break;
       default:
@@ -92,6 +96,7 @@ export function describe(settings: Settings): string {
     `DeepThink: ${on(settings.deepThink)} | ` +
     `Search: ${on(settings.search)} | ` +
     `Exec timeout: ${secs}s | ` +
+    `Browser: ${settings.browser ?? "auto"} | ` +
     `Skip: ${skip}`
   );
 }

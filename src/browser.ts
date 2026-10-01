@@ -12,15 +12,28 @@ import { execFileSync } from "node:child_process";
 type Candidate = {
   label: string;
   type: BrowserType;
-  // Playwright channel name (chrome, msedge, ...). When set, we call
-  // launch({ channel }) instead of executablePath.
   channel?: string;
-  // Explicit binary path. Used when the browser is not on a Playwright
-  // channel but exists on the system (Brave, Chromium, Vivaldi, ...).
   path?: string;
 };
 
-// 1) Playwright channels — these are the officially supported names.
+// Aliases so users can type the friendly name.
+const ALIASES: Record<string, string> = {
+  chrome: "chrome",
+  google: "chrome",
+  "google-chrome": "chrome",
+  edge: "msedge",
+  "ms-edge": "msedge",
+  microsoft: "msedge",
+  brave: "brave",
+  chromium: "chromium",
+  vivaldi: "vivaldi",
+  opera: "opera",
+  firefox: "firefox",
+  ff: "firefox",
+  webkit: "webkit",
+  safari: "webkit",
+};
+
 const CHANNEL_CANDIDATES: Candidate[] = [
   { label: "chrome", type: chromium, channel: "chrome" },
   { label: "chrome-beta", type: chromium, channel: "chrome-beta" },
@@ -34,25 +47,21 @@ const CHANNEL_CANDIDATES: Candidate[] = [
   { label: "webkit", type: webkit, channel: "webkit" },
 ];
 
-// 2) Well-known binaries we can find on PATH. Order matters — user's
-// preferred browser first.
-const PATH_BINARIES: Array<{ label: string; type: BrowserType; bin: string }> = [
-  { label: "brave", type: chromium, bin: "brave-browser" },
-  { label: "brave", type: chromium, bin: "brave" },
-  { label: "chromium", type: chromium, bin: "chromium" },
-  { label: "chromium", type: chromium, bin: "chromium-browser" },
-  { label: "google-chrome", type: chromium, bin: "google-chrome" },
-  { label: "google-chrome-stable", type: chromium, bin: "google-chrome-stable" },
-  { label: "microsoft-edge", type: chromium, bin: "microsoft-edge" },
-  { label: "microsoft-edge-stable", type: chromium, bin: "microsoft-edge-stable" },
-  { label: "vivaldi", type: chromium, bin: "vivaldi" },
-  { label: "opera", type: chromium, bin: "opera" },
-  { label: "firefox", type: firefox, bin: "firefox" },
+const PATH_BINARIES: Array<{ name: string; type: BrowserType; bins: string[] }> = [
+  { name: "brave", type: chromium, bins: ["brave-browser", "brave"] },
+  { name: "chromium", type: chromium, bins: ["chromium", "chromium-browser"] },
+  { name: "chrome", type: chromium, bins: ["google-chrome", "google-chrome-stable"] },
+  { name: "msedge", type: chromium, bins: ["microsoft-edge", "microsoft-edge-stable"] },
+  { name: "vivaldi", type: chromium, bins: ["vivaldi", "vivaldi-stable"] },
+  { name: "opera", type: chromium, bins: ["opera"] },
+  { name: "firefox", type: firefox, bins: ["firefox"] },
 ];
 
 type LaunchOptions = {
   profileDir: string;
   headless?: boolean;
+  // Requested browser name (from --browser). null = auto-detect.
+  preferred?: string | null;
 };
 
 function which(bin: string): string | null {
@@ -89,28 +98,57 @@ async function tryLaunch(candidate: Candidate): Promise<boolean> {
   }
 }
 
-async function detectBrowser(): Promise<Candidate> {
-  // Channels first.
+async function detectAll(): Promise<Candidate[]> {
+  const found: Candidate[] = [];
+
   for (const c of CHANNEL_CANDIDATES) {
-    if (await tryLaunch(c)) return c;
+    if (await tryLaunch(c)) found.push(c);
   }
 
-  // Then PATH binaries.
   for (const b of PATH_BINARIES) {
-    const resolved = which(b.bin);
-    if (!resolved) continue;
-    if (!(await exists(resolved))) continue;
-    const candidate: Candidate = {
-      label: `${b.label} (${resolved})`,
-      type: b.type,
-      path: resolved,
-    };
-    if (await tryLaunch(candidate)) return candidate;
+    for (const bin of b.bins) {
+      const resolved = which(bin);
+      if (!resolved) continue;
+      if (!(await exists(resolved))) continue;
+      const candidate: Candidate = {
+        label: `${b.name} (${resolved})`,
+        type: b.type,
+        path: resolved,
+      };
+      if (await tryLaunch(candidate)) {
+        found.push(candidate);
+        break; // one binary per family
+      }
+    }
   }
+
+  return found;
+}
+
+async function pickBrowser(preferred?: string | null): Promise<Candidate> {
+  const all = await detectAll();
+
+  if (!preferred) {
+    if (all.length === 0) {
+      throw new Error(
+        "No usable browser found. Install one of: Chrome, Chromium, Brave, " +
+          "Edge, Vivaldi, Opera, or Firefox.",
+      );
+    }
+    return all[0];
+  }
+
+  const wanted = ALIASES[preferred] ?? preferred;
+
+  const match = all.find(
+    (c) => c.label === wanted || c.label.startsWith(wanted + " "),
+  );
+  if (match) return match;
 
   throw new Error(
-    "No usable browser found. Install one of: Chrome, Chromium, Brave, " +
-      "Edge, Vivaldi, Opera, or Firefox.",
+    `Browser "${preferred}" not found. Available: ${all
+      .map((c) => c.label)
+      .join(", ")}`,
   );
 }
 
@@ -151,8 +189,9 @@ async function installClipboardCapture(context: BrowserContext): Promise<void> {
 export async function launchPersistent({
   profileDir,
   headless = false,
+  preferred = null,
 }: LaunchOptions): Promise<BrowserContext> {
-  const candidate = await detectBrowser();
+  const candidate = await pickBrowser(preferred);
   console.log(`Using system browser: ${candidate.label}`);
 
   await mkdir(profileDir, { recursive: true });
